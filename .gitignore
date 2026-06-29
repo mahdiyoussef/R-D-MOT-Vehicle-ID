@@ -14,3 +14,8 @@ outputs/
 *.pt
 *.onnx
 *.pth
+
+# Scratch and test files
+scratch_test.py
+generate_kaggle_notebook.py
+test_v4_output.txt
