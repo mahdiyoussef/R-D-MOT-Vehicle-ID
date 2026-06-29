@@ -1,0 +1,21 @@
+# Preset: BALANCED — recommended for GPU deployments
+# ~20 FPS on RTX 3080 @ 1080p. Strong Re-ID + robust tracking.
+extends: "configs/pipeline.yaml"
+
+strategy:
+  reid_backend:    "transreid"
+  tracker_backend: "botsort_reid"
+  gallery_backend: "auto"
+
+transreid:
+  model_name: "vit_small_patch16_224"
+  embed_dim:  384
+  feature_update_interval: 5
+
+botsort_reid:
+  cmc_method:   "ecc"
+  reid_weight:  0.4
+
+faiss_ivf:
+  nlist:  128
+  nprobe: 16

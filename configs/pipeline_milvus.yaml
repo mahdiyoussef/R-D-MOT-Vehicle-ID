@@ -1,0 +1,51 @@
+pipeline:
+  name: "Long-Term-Vehicle-ReID-Pipeline"
+  version: "1.0"
+  debug_mode: true
+  device: "auto"
+
+# Step 1: The 'Where'
+detector:
+  model_type: "yolov10"
+  weights_path: "outputs/results/weights/best.pt"
+  confidence_threshold: 0.50
+  iou_threshold: 0.45
+  classes: [0, 1] # 0=forklift, 1=person
+  input_resolution: [640, 640]
+  tracker_config: "botsort.yaml"
+
+# Step 2: The 'Continuous Path'
+tracker:
+  algorithm: "bot_sort"
+  track_high_thresh: 0.60
+  track_low_thresh: 0.10
+  new_track_thresh: 0.70
+  track_buffer: 30
+  match_thresh: 0.80
+
+# Step 3: The 'Signature'
+reid_extractor:
+  model_type: "transreid" # or "osnet"
+  backbone: "vit_base_patch16_224"
+  weights_path: "models/reid/osnet_x0_25_msmt17.pt"
+  embedding_dimension: 768
+  batch_size: 16
+  reid_classes: [0, 1]
+  extraction_trigger:
+    min_box_area: 5000
+    frame_interval: 5
+
+# Step 4: The 'Memory'
+vector_database:
+  provider: "milvus"
+  host: "localhost"
+  port: 19530
+  collection_name: "vehicle_embeddings"
+  index_type: "HNSW"
+  metric_type: "COSINE"
+
+# The Logic: Connecting Tracker to Memory
+association_logic:
+  cosine_similarity_threshold: 0.85
+  top_k_search: 5
+  max_memory_retention_seconds: 86400

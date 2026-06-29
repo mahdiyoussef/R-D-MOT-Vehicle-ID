@@ -1,0 +1,16 @@
+results.zip
+env/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.DS_Store
+
+# Data and Models
+data/
+models/
+outputs/
+*.mp4
+*.pt
+*.onnx
+*.pth

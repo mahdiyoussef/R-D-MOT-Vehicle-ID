@@ -1,0 +1,22 @@
+# Preset: SOTA — maximum accuracy, higher compute cost
+# ~12 FPS on RTX 3080 @ 1080p. Best for post-processing / analysis.
+extends: "configs/pipeline.yaml"
+
+strategy:
+  reid_backend:    "clipreid"
+  tracker_backend: "strongsort_v2"
+  gallery_backend: "faiss_ivf"    # force FAISS regardless of gallery size
+
+clipreid:
+  clip_model: "ViT-B/16"
+  embed_dim:  512
+  feature_update_interval: 8
+
+strongsort_v2:
+  aflink_enabled: true
+  gsi_enabled:    true
+  ema_alpha:      0.9
+
+faiss_ivf:
+  nlist:  256
+  nprobe: 32

@@ -1,0 +1,56 @@
+# ── Detection ──────────────────────────────────────────────────────────────────
+ultralytics>=8.2.0
+
+# ── Tracking ───────────────────────────────────────────────────────────────────
+boxmot>=10.0.0
+
+# ── ReID Embedding ─────────────────────────────────────────────────────────────
+# torchreid — install from source (PyPI version is outdated):
+# pip install git+https://github.com/KaiyangZhou/deep-person-reid.git
+# OR: pip install torchreid  (installs 0.2.x — limited but functional)
+torchreid
+timm>=0.9.0
+einops
+
+# ── Matching ───────────────────────────────────────────────────────────────────
+scipy>=1.11.0
+scikit-learn>=1.3.0
+faiss-cpu
+pymilvus>=2.4.0
+
+# ── Data & Utilities ───────────────────────────────────────────────────────────
+opencv-python>=4.8.0
+numpy>=1.24.0
+Pillow>=10.0.0
+pandas>=2.0.0
+matplotlib>=3.7.0
+tqdm>=4.65.0
+PyYAML>=6.0
+supervision>=0.18.0
+torch
+torchvision
+
+# ── Optional Experiment Tracking ───────────────────────────────────────────────
+tensorboard
+# wandb  (optional — Weights & Biases experiment tracking)
+
+# ── v2.0 Upgrade Dependencies ─────────────────────────────────────────────────
+# CLIP-ReID backbone (install from source)
+# pip install git+https://github.com/openai/CLIP.git
+# clip @ git+https://github.com/openai/CLIP.git
+
+# FAISS — already listed above; choose ONE:
+# faiss-cpu>=1.8.0   (already included)
+# faiss-gpu>=1.8.0   (GPU deployment — comment out faiss-cpu above)
+
+# Hugging Face Hub for weight downloads
+huggingface-hub>=0.23.0
+
+# Kalman filter for BoT-SORT-ReID
+filterpy>=1.4.5
+
+# gdown for Google Drive downloads
+gdown>=4.7.1
+
+# plotly for Streamlit benchmark charts
+plotly>=5.17.0

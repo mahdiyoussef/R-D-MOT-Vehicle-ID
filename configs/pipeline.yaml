@@ -1,0 +1,342 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Vehicle Persistent ReID — Runtime Pipeline Configuration
+# ─────────────────────────────────────────────────────────────────────────────
+
+pipeline:
+  device: "cuda:0"          # 'cuda:0' | 'cpu'
+  half_precision: true      # FP16 inference (GPU only)
+
+detection:
+  weights: "models/yolo/yolo11m.pt"
+  fallback_weights: "yolo11m.pt"          # auto-downloaded if fine-tuned not found
+  confidence_threshold: 0.4
+  iou_threshold: 0.45
+  imgsz: 640
+  vehicle_classes:
+    0: "person"
+    2: "car"
+    3: "motorcycle"
+    5: "bus"
+    7: "truck"
+  reid_class_ids: [2, 3, 5, 7]
+
+tracking:
+  reid_weights: "models/trackers/osnet_x0_25_msmt17.pt"
+  max_age: 60
+  min_hits: 3
+  iou_threshold: 0.3
+  half: true
+
+embedding:
+  weights: "models/reid/osnet_veri776.pth"
+  backbone: "osnet_x1_0"
+  embedding_dim: 512
+  input_size: [128, 256]    # [width, height]
+  batch_size: 32
+
+gallery:
+  similarity_threshold: 0.85
+  max_embeddings_per_id: 15
+  gallery_timeout_frames: 5000
+  new_track_grace_period: 5
+
+matching:
+  threshold: 0.85
+  reranking_enabled: true
+  reranking_k1: 20
+  reranking_k2: 6
+  reranking_lambda: 0.3
+
+view_synthesis:
+  enabled: true
+  model: "controlnet_vehicle"
+
+visualization:
+  show_confidence: true
+  show_trajectory: true
+  trajectory_length: 30
+  box_colors:
+    new:       [0, 255, 0]
+    recovered: [0, 128, 255]
+    tracked:   [255, 255, 0]
+
+output:
+  video_codec: "mp4v"
+  log_format: "jsonl"           # 'csv' | 'jsonl'
+  gallery_prune_interval: 500   # frames between gallery cleanup passes
+
+# ── Strategy Selection (v2.0 + v3.0) ─────────────────────────────────────────
+# Controls which backend implementation is loaded for each component.
+# Changing these keys hot-swaps the implementation; no code changes needed.
+strategy:
+  reid_backend:    "dinov2"       # osnet | transreid | clipreid | multibranch | dinov2
+  tracker_backend: "legacy"       # legacy | botsort_reid | strongsort_v2 | yolo_native
+  gallery_backend: "numpy"        # numpy | faiss_ivf | auto | probabilistic
+  matcher_backend: "hungarian"    # hungarian | gnn
+
+# ── TransReID Backend (NEW in v2.0) ───────────────────────────────────────────
+transreid:
+  model_name:     "vit_small_patch16_224"   # timm identifier for ViT-S/16
+  embed_dim:      384                        # ViT-S output dimension
+  image_size:     [256, 128]                 # H x W for vehicle Re-ID
+  stride:         16                         # non-overlapping patches
+  pretrained_weights: "models/reid/transreid_vit_small_veri776.pth"
+  weights_gdrive_id:  "1PLACE_HOLDER_TRANSREID_VIT_SMALL_ID"
+  jigsaw_patches_module:
+    enabled:        true
+    shift_num:      5
+    patch_shuffle:  true
+    divide_length:  4
+    num_groups:     4
+  side_information_embeddings:
+    enabled:        true
+    num_cameras:    20              # match dataset; 0 = disable SIE
+    num_views:      3
+  bnneck:           true            # BNNeck before metric head
+  feature_update_interval: 5       # re-extract every N frames
+
+# ── CLIP-ReID Backend (NEW in v2.0) ───────────────────────────────────────────
+clipreid:
+  clip_model:     "ViT-B/16"       # openai CLIP backbone
+  embed_dim:      512              # CLIP ViT-B output dim
+  image_size:     [224, 224]       # CLIP native resolution
+  pretrained_weights: "models/reid/clipreid_veri776.pth"
+  weights_gdrive_id:  "1PLACE_HOLDER_CLIPREID_ID"
+  prompt_learner:
+    n_ctx:          16             # number of learnable context tokens
+    ctx_init:       "a photo of a"
+    class_token_position: "end"
+    csc:            false          # class-specific context
+  stage2_finetuned: true           # use stage-2 fine-tuned weights
+  feature_update_interval: 8      # CLIP is heavier; update less often
+
+# ── Multi-Branch Feature Head (NEW in v2.0) ───────────────────────────────────
+multibranch:
+  num_parts:      4               # horizontal stripes for local branch
+  global_dim:     768             # global branch embedding dim
+  local_dim:      256             # per-part local embedding dim
+  fusion:         "concat"        # concat | weighted_sum | attention
+  attention_heads: 4              # used only when fusion=attention
+  dropout:        0.1
+  backbone:       "transreid"     # transreid | clipreid | osnet
+
+# ── BoT-SORT-ReID Tracker (NEW in v2.0) ──────────────────────────────────────
+botsort_reid:
+  max_age:             60
+  min_hits:            3
+  iou_threshold:       0.3
+  cmc_method:          "ecc"      # ecc | orb | sof (sparse optical flow)
+  cmc_downscale:       2          # downscale frame before ECC for speed
+  reid_weight:         0.4        # weight of ReID cost vs IoU cost (0=IoU only)
+  reid_thresh_new:     0.85        # embedding sim below this → new track
+  embedding_buffer:    30         # frames of embedding history per track
+  match_thresh_high:   0.8        # high-confidence match gate
+  match_thresh_low:    0.5        # low-confidence match gate (second pass)
+  second_pass_iou:     0.5        # IoU threshold for low-conf second pass
+
+# ── StrongSORT v2 Tracker (NEW in v2.0) ──────────────────────────────────────
+strongsort_v2:
+  max_age:             60
+  min_hits:            3
+  iou_threshold:       0.3
+  aflink_enabled:      true
+  aflink_model_path:   "models/aflink.pth"
+  aflink_window:       30         # temporal window (frames) for AFLink
+  aflink_min_length:   2          # minimum tracklet length to apply AFLink
+  aflink_prob_thresh:  0.8        # probability threshold for linking
+  gsi_enabled:         true
+  gsi_interval:        20         # interpolate gaps up to N frames
+  gsi_tau:             10.0       # Gaussian kernel bandwidth
+  ema_alpha:           0.9        # embedding EMA coefficient
+
+# ── FAISS IVF Gallery (NEW in v2.0) ──────────────────────────────────────────
+faiss_ivf:
+  index_type:          "IVFFlat"  # IVFFlat | IVFPQ | IVFScalarQuantizer
+  metric:              "inner_product"  # inner_product (cosine for L2-norm vecs)
+  nlist:               128        # number of IVF clusters
+  nprobe:              16         # clusters to search at query time
+  auto_promote_threshold: 1000   # switch from numpy to FAISS at this size
+  similarity_threshold: 0.85     # min similarity to accept a gallery match
+  ivfpq_m:             64         # IVFPQ: number of sub-quantizers
+  ivfpq_nbits:         8          # IVFPQ: bits per sub-quantizer
+  min_train_vectors:   256        # need at least this many vecs to train index
+  retrain_on_add:      false      # retrain index when gallery grows >20%
+  retrain_growth_ratio: 0.2
+  use_gpu:             false      # set true if faiss-gpu installed
+  gpu_id:              0
+
+# ── YOLO Native Tracker (NEW in v2.0) ────────────────────────────────────────
+yolo_native:
+  tracker_type:        "botsort"   # botsort | bytetrack (Ultralytics built-in)
+  track_high_thresh:   0.5         # High confidence first-pass association
+  track_low_thresh:    0.1         # Low confidence second-pass (ByteTrack)
+  new_track_thresh:    0.6         # Threshold to initialize a new track
+  track_buffer:        60          # Frames to keep lost tracks alive (max_age)
+  match_thresh:        0.8         # IoU matching threshold
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v3.0 — State-of-the-Art Upgrades
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── DINOv2 + LoRA Re-ID Backend (NEW in v3.0) ────────────────────────────────
+# Meta's DINOv2 foundation model (self-supervised, 142M image pretraining)
+# with LoRA adapters for parameter-efficient vehicle Re-ID fine-tuning.
+dinov2:
+  model_name:          "dinov2_vits14"     # dinov2_vits14 | dinov2_vitb14
+  embed_dim:           768                  # output embedding dimension
+  image_size:          [224, 224]           # H x W input resolution
+  lora_rank:           8                    # LoRA adapter rank
+  lora_alpha:          32.0                 # LoRA scaling factor
+  lora_dropout:        0.1                  # LoRA dropout rate
+  lora_target_modules: ["qkv"]             # attention layers to inject LoRA
+  pretrained_lora_weights: "models/reid/dinov2_lora_veri776.pth"
+  weights_gdrive_id:   "1PLACE_HOLDER_DINOV2_LORA_ID"
+  gem_pooling_p:       3.0                 # GeM pooling power parameter
+  head_dropout:        0.1                 # projection head dropout
+  batch_size:          32                  # max batch for TensorRT compilation
+  feature_update_interval: 5              # re-extract every N frames
+
+# ── Temporal Tracklet Aggregator (NEW in v3.0) ───────────────────────────────
+# Cross-attention Transformer that fuses multi-frame embeddings per track
+# into a single robust representation. Downweights blurry/occluded frames.
+temporal_aggregator:
+  enabled:             true
+  buffer_size:         16                  # max embeddings buffered per track
+  min_frames:          3                   # min frames before aggregation
+  num_layers:          2                   # attention layers
+  num_heads:           4                   # attention heads
+  dropout:             0.1
+  pretrained_weights:  ""                  # path to trained aggregator weights
+
+# ── Probabilistic Gallery (NEW in v3.0) ──────────────────────────────────────
+# Models each identity as a Gaussian N(μ, σ²) using Welford's online algorithm.
+# Matching uses Mutual Likelihood Score (MLS) instead of cosine similarity.
+probabilistic_gallery:
+  mls_threshold:       -500.0              # minimum MLS to accept match
+  min_absence_frames:  0                   # frames absent before queryable
+  variance_prior:      1.0                 # initial per-dimension variance
+  min_observations:    2                   # min observations before queryable
+
+# ── GNN Context-Aware Matcher (NEW in v3.0) ──────────────────────────────────
+# Graph Attention Network that propagates spatial-temporal context between
+# detections and gallery entries before Hungarian assignment.
+gnn_matcher:
+  enabled:             true
+  num_layers:          2                   # GNN message passing rounds
+  node_dim:            256                 # internal node feature dimension
+  edge_dim:            64                  # edge encoding dimension
+  num_heads:           4                   # GAT attention heads
+  dropout:             0.1
+  cosine_weight:       0.6                 # blend: w*GNN + (1-w)*cosine
+  threshold:           0.85                # min affinity to accept match
+  fallback_to_hungarian: true              # fall back on GNN error
+  pretrained_weights:  ""                  # path to trained GNN weights
+
+# ══════════════════════════════════════════════════════════════════════════════
+# v4.0 — CROSS-VIEW Pipeline Upgrades
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── v4.0 Detection Upgrade ────────────────────────────────────────────────────
+# min_bbox_area_px2 and ROI mask are additive — v1/v2/v3 detection still works.
+detection_v4:
+  min_bbox_area_px2: 800          # suppress detections smaller than this area
+  sahi_enabled: false             # slice-and-reassemble for aerial/distant vehicles
+  sahi_slice_height: 512
+  sahi_slice_width: 512
+  sahi_overlap_ratio: 0.2
+  roi_mask_path: ""               # optional path to binary mask PNG (empty = disabled)
+
+# ── v4.0 View Classifier ─────────────────────────────────────────────────────
+# Lightweight MLP head on top of backbone CLS token — zero extra forward pass.
+view_classifier:
+  enabled: true
+  confidence_threshold: 0.60     # below this → "ambiguous"
+  classes: ["front", "rear", "side_left", "side_right", "top_down", "ambiguous"]
+  single_view_warn_frames: 30    # warn if a track only has one view for N frames
+  pretrained_weights: ""         # path to trained view classifier head
+
+# ── v4.0 Part Embeddings ─────────────────────────────────────────────────────
+# Divide vehicle crop into N horizontal stripes. Each stripe is embedded independently.
+# Used for cross-view part-filtered cosine matching (Step 5.3).
+part_embedding:
+  num_stripes: 6
+  stripe_dim: 128                # per-stripe embedding dimension
+  zero_pad_occluded: true        # zero-fill stripes that are out-of-frame
+
+# ── v4.0 Attribute Extraction ─────────────────────────────────────────────────
+# Extracts semantic vehicle attributes for fallback matching (Step 5.4).
+attributes:
+  enabled: true
+  color_classes:
+    - "white"
+    - "black"
+    - "silver"
+    - "red"
+    - "blue"
+    - "green"
+    - "yellow"
+    - "orange"
+    - "brown"
+    - "purple"
+    - "gold"
+    - "gray"
+  vehicle_classes:
+    - "car"
+    - "truck"
+    - "van"
+    - "motorcycle"
+    - "bus"
+    - "pickup"
+    - "suv"
+    - "emergency"
+  enable_plate_ocr: false        # requires 'easyocr' package
+  plate_min_chars: 2
+  roof_rack_classifier: false    # lightweight binary head (requires training)
+  tow_hitch_classifier: false
+
+# ── v4.0 Gallery Upgrade ──────────────────────────────────────────────────────
+# Per-view embedding slots with cold storage and track_status FSM.
+# Existing gallery.similarity_threshold is still used as primary cosine gate.
+gallery_v4:
+  max_embeddings_per_view: 8     # rolling window per view slot (front/rear/etc.)
+  lost_timeout_frames: 150       # frames absent → "lost" status (5s @ 30fps)
+  cold_storage_timeout_frames: 18000  # frames absent → "expired" (10min @ 30fps)
+  cold_reentry_threshold: 0.85   # stricter threshold for re-entry from cold storage
+
+# ── v4.0 Matching Thresholds ──────────────────────────────────────────────────
+# 5-step decision tree for identity assignment.
+matching_v4:
+  iou_continuation_threshold: 0.50    # Step 5.1: same bbox → extend track
+  same_view_match_threshold: 0.75     # Step 5.2: same-view cosine MATCH gate
+  same_view_uncertain_low: 0.60       # Step 5.2: below this → skip to 5.4
+  cross_view_match_threshold: 0.55    # Step 5.3: part-filtered cross-view gate
+  attribute_score_threshold: 0.60     # Step 5.4: attribute fallback gate
+  human_review_flag_threshold: 0.45   # flag for human review if rejected sim > this
+
+# Cross-view visible stripe map (which of the 6 stripes are geometrically
+# visible when comparing two different viewpoints).
+# Indices: 0=roof, 1=upper-body, 2=mid-upper, 3=mid-lower, 4=lower-body, 5=bumper
+cross_view_stripe_map:
+  front_side_left:   [0, 1]
+  front_side_right:  [0, 1]
+  rear_side_left:    [0, 1]
+  rear_side_right:   [0, 1]
+  front_rear:        [0]
+  side_left_side_right: [0, 1, 2, 3, 4, 5]   # mirror match — use all stripes
+  top_down_any:      []                         # no visual cosine — attribute only
+
+# Attribute fallback scoring weights (must sum to 1.0)
+attribute_weights:
+  color_match:          0.35
+  vehicle_class_match:  0.25
+  plate_chars_match:    0.30
+  roof_rack_match:      0.05
+  tow_hitch_match:      0.05
+
+# ── v4.0 Tracklet Memory ─────────────────────────────────────────────────────
+# Kalman filter freeze on LOST, spatial re-entry boosting.
+tracklet_memory:
+  enabled: true
+  lost_buffer_frames: 300        # keep lost track in Kalman buffer for N frames
+  spatial_zone_radius_px: 150    # expected re-entry zone radius (soft gate)
+  kalman_enabled: true           # freeze Kalman state on loss, extrapolate position

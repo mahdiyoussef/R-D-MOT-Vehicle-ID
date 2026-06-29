@@ -1,0 +1,37 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ReID Training Configuration (OSNet on VeRi-776)
+# ─────────────────────────────────────────────────────────────────────────────
+
+model:
+  name: "osnet_x1_0"
+  loss: "softmax"
+  pretrained: true
+
+data:
+  root: "data/raw"
+  sources: ["veri"]          # VeRi-776
+  targets: ["veri"]
+  height: 256
+  width: 128
+  batch_size_train: 32
+  batch_size_test: 100
+  transforms:
+    - "random_flip"
+    - "random_crop"
+    - "random_erasing"
+
+optimizer:
+  name: "adam"
+  lr: 0.0003
+  weight_decay: 0.0005
+
+scheduler:
+  name: "cosine"
+  stepsize: 20
+
+training:
+  max_epoch: 60
+  eval_freq: 10
+  print_freq: 50
+  save_dir: "models/reid/"
+  label_smooth: true

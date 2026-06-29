@@ -1,0 +1,16 @@
+# Preset: FAST — original v1.0 strategy stack
+# CPU-friendly. Use for development and low-resource deployment.
+# Maps to the existing pipeline components unchanged.
+extends: "configs/pipeline.yaml"
+
+strategy:
+  reid_backend:    "osnet"
+  tracker_backend: "legacy"
+  gallery_backend: "numpy"
+
+embedding:
+  weights: "models/reid/osnet_veri776.pth"
+  backbone: "osnet_x1_0"
+  embedding_dim: 512
+  input_size: [128, 256]
+  batch_size: 32
