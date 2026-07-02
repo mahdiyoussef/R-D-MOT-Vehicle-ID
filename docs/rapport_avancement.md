@@ -19,9 +19,9 @@ robuste aux occlusions (tunnels, angles morts) et aux changements de point de vu
 
 ---
 
-## 2. Architecture globale du pipeline (v5.0)
+## 2. Architecture globale du pipeline
 
-Le pipeline de traitement a été conçu selon une architecture modulaire en sept étapes séquentielles (récemment mise à jour vers la version 5.0). Cette structure en cascade permet d'optimiser les calculs en reportant les opérations les plus lourdes (l'extraction par apprentissage profond) uniquement sur les cibles géométriquement viables, tout en intégrant des mécanismes d'état de l'art (SOTA).
+Le pipeline de traitement a été conçu selon une architecture modulaire en sept étapes séquentielles. Cette structure en cascade permet d'optimiser les calculs en reportant les opérations les plus lourdes (l'extraction par apprentissage profond) uniquement sur les cibles géométriquement viables, tout en intégrant des mécanismes d'état de l'art (SOTA).
 
 ```text
 Trame brute
@@ -120,16 +120,18 @@ $$ \qquad\qquad + \quad 0.05 \cdot \mathbb{1}[\text{rack}] + 0.05 \cdot \mathbb{
 
 ## 6. Défis et Enjeux Actuels
 
-Bien que l'architecture v5.0 soit massivement optimisée, le système fait encore face à trois défis majeurs en cours de résolution :
+Bien que l'architecture soit massivement optimisée, le système fait encore face à trois défis majeurs en cours de résolution :
 
 1. **Le processus de correspondance (Matching) entre l'image détectée et la Base de Données Vectorielle (Vector DB)** :  
-   Les images détectées peuvent parfois souffrir de mauvaises conditions d'éclairage ou de flou de mouvement. Trouver l'équilibre parfait entre une recherche vectorielle rapide (FAISS / indexation HNSW) et une recherche sémantiquement exhaustive reste un défi. De légères variations dans l'image peuvent éloigner drastiquement l'empreinte vectorielle du cluster attendu.
+   Les images détectées peuvent parfois souffrir de mauvaises conditions d'éclairage ou de flou de mouvement. Trouver l'équilibre parfait entre une recherche vectorielle rapide et une recherche sémantiquement exhaustive reste un défi. De légères variations dans l'image peuvent éloigner drastiquement l'empreinte vectorielle du cluster attendu.  
+   **Solution intégrée (v6.0)** : Déploiement d'une **Agrégation Temporelle contrôlée par la qualité** (Quality-gated temporal aggregation) qui ignore automatiquement les trames floues ou très petites, et application du **k-Reciprocal Re-Ranking** direct dans la cascade de décision pour filtrer les faux positifs. Une vérification de marge de sécurité rejette ou signale pour révision humaine les cas d'ambiguïté (top-2 très proches).
 
 2. **Le défi de la ré-identification d'un véhicule après une longue disparition (Occlusions Longues)** :  
-   Lorsqu'un véhicule disparaît (par exemple en stationnant ou derrière un poids lourd), l'incertitude spatiale grandit considérablement. Si le véhicule réapparaît avec des caractéristiques modifiées (ex: feux allumés, charge différente), relier sa nouvelle détection à son ancien ID sans créer de faux positifs demande un ajustement délicat des seuils de similarité et de la tolérance spatio-temporelle.
+   Lorsqu'un véhicule disparaît (par exemple en stationnant ou derrière un poids lourd), l'incertitude spatiale grandit considérablement. Si le véhicule réapparaît avec des caractéristiques modifiées (ex: feux allumés, charge différente), relier sa nouvelle détection à son ancien ID sans créer de faux positifs demande un ajustement délicat des seuils de similarité et de la tolérance spatio-temporelle.  
+   **Solution intégrée (v6.0)** : Implémentation d'une **Dual-Memory Bank (Mémoire à double voie)**. Lorsqu'un véhicule disparaît, sa meilleure empreinte visuelle est "gelée" et archivée. Lors de sa réapparition potentielle, le système compare la détection actuelle à la fois avec les mémoires actives et les archives gelées. Le seuil d'acceptation s'adapte dynamiquement selon la durée d'absence (tolérance plus élevée pour une absence courte, seuil plus strict après plusieurs minutes).
    
    ![Défi de perte et de ré-identification](defi_reid.png)
-   *Figure 1 : Le défi principal de ré-identification : le pipeline peine à ré-identifier le véhicule s'il disparaît temporairement de la scène.*
+   *Figure 1 : Le défi principal de ré-identification : le pipeline peine à ré-identifier le véhicule s'il disparaît temporairement de la scène. La Dual-Memory Bank vient pallier ce défaut.*
 
 3. **Le défi du stockage et de l'acquisition du véhicule sous toutes ses faces (Multi-View)** :  
    Pour identifier formellement un véhicule, le système a besoin de le stocker sous plusieurs angles (Face, Arrière, Profils). Cependant, lors d'une première observation, la caméra ne capte souvent qu'un seul point de vue (ex: l'avant). La solution en cours de développement, la **Synthèse Générative de Vues (ControlNet / VehicleGAN)**, cherche à "halluciner" les vues manquantes de manière synthétique pour pré-remplir la *CrossViewGallery*, permettant un appariement immédiat avant même que le véhicule ne tourne physiquement.
@@ -159,10 +161,10 @@ Pour faire face à ces défis, l'application utilise une configuration stricte �
 
 ## 8. Prochaines Étapes
 
-1. **Synthèse de Vue Générative (C3)** : Entraînement et activation complète d'un modèle ControlNet/VehicleGAN pour "halluciner" les vues manquantes des véhicules détectés sous un seul angle.
-2. **Optimisation des Adaptateurs LoRA** : Exécution de la phase de fine-tuning du modèle DINOv2 sur un serveur GPU dédié (Kaggle T4x2) en utilisant le jeu de données VeRi-776 pour maximiser la distinction visuelle entre véhicules similaires.
-3. **Accélération Matérielle TensorRT** : Conversion des modèles pyTorch vers le moteur NVIDIA TensorRT (précision INT8) pour atteindre un temps d'exécution inférieur à 5 millisecondes par trame sur des cartes graphiques embarquées.
-4. **Évaluation Quantitative** : Mesure des métriques standardisées de suivi multi-cibles (MOTA : *Multi-Object Tracking Accuracy* et IDS : *Identity Switches*) sur des séquences vidéo de référence pour valider l'apport qualitatif de la cascade de décision et du k-Reciprocal Re-Ranking.
+1. **Fusion Multi-Granularité** : Séparation de l'extraction DINOv2 en chemins parallèles pour capturer à la fois la forme globale et les détails précis par bandes horizontales (détails de calandre, stickers) afin de mieux distinguer deux véhicules de même modèle et de même couleur.
+2. **Synthèse de Vue Générative (C3)** : Entraînement et activation complète d'un modèle ControlNet/VehicleGAN pour "halluciner" les vues manquantes des véhicules détectés sous un seul angle.
+3. **Optimisation des Adaptateurs LoRA & Perte ArcFace** : Exécution de la phase de fine-tuning du modèle DINOv2 sur un serveur GPU dédié (Kaggle) en ajoutant une perte de marge angulaire (ArcFace) pour maximiser la distinction visuelle entre véhicules similaires.
+4. **Accélération Matérielle TensorRT & FAISS** : Remplacement final du scan linéaire dans la galerie par un index de recherche approximative FAISS et conversion des modèles pyTorch vers le moteur NVIDIA TensorRT (précision INT8).
 
 ---
 
