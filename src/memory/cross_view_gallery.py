@@ -88,8 +88,17 @@ class CrossViewGallery:
             config.get("gallery", {}).get("similarity_threshold", 0.85)
         )
 
+        # ── v6.0: Dual-Memory Bank parameters ─────────────────────────────────
+        # Time-adaptive re-entry: threshold increases logarithmically with
+        # absence duration to require more evidence for longer disappearances.
+        self._reentry_base_thresh = float(cfg.get("reentry_base_threshold", 0.70))
+        self._reentry_beta        = float(cfg.get("reentry_time_beta", 0.04))
+        self._reentry_tau         = float(cfg.get("reentry_time_tau", 150.0))  # frames
+        self._assumed_fps         = float(cfg.get("assumed_fps", 30.0))
+
         self._gallery:      dict[int, dict] = {}
         self._cold_storage: dict[int, dict] = {}
+        self._archive_embeds: dict[int, tuple[np.ndarray, int]] = {}  # gid -> (frozen_embed, frame_lost)
         self._next_global_id: int = 1
 
     # ── Core API ───────────────────────────────────────────────────────────────
@@ -211,17 +220,24 @@ class CrossViewGallery:
         if best_id is not None and best_score >= self._similarity_threshold:
             return best_id, best_score, best_source
 
-        # Check cold storage with stricter threshold
+        # Check cold storage with time-adaptive threshold (v6.0)
         cold_id, cold_score = self._query_cold_storage(
-            normalized_query, view_label, class_id, excluded_ids, part_embeds
+            normalized_query, view_label, class_id, excluded_ids, part_embeds,
+            frame_index=frame_index,
         )
-        if cold_id is not None and cold_score >= self._cold_reentry_thresh:
-            restored_entry = self._cold_storage.pop(cold_id)
-            restored_entry["track_status"] = "active"
-            restored_entry["lost_since"]   = None
-            self._gallery[cold_id] = restored_entry
-            logger.info("Gallery: gid=%d restored from cold storage (sim=%.3f)", cold_id, cold_score)
-            return cold_id, cold_score, "cold_reentry"
+        if cold_id is not None:
+            adaptive_thresh = self._compute_adaptive_reentry_threshold(cold_id, frame_index)
+            if cold_score >= adaptive_thresh:
+                restored_entry = self._cold_storage.pop(cold_id)
+                restored_entry["track_status"] = "active"
+                restored_entry["lost_since"]   = None
+                self._gallery[cold_id] = restored_entry
+                self._archive_embeds.pop(cold_id, None)  # Clear archive on re-entry
+                logger.info(
+                    "Gallery: gid=%d restored from cold storage (sim=%.3f, adaptive_thresh=%.3f)",
+                    cold_id, cold_score, adaptive_thresh,
+                )
+                return cold_id, cold_score, "cold_reentry"
 
         return None, best_score, "no_match"
 
@@ -250,7 +266,12 @@ class CrossViewGallery:
                 entry["track_status"] = "lost"
                 entry["lost_since"]   = frame_index
                 newly_lost.append(gid)
-                logger.debug("Gallery: gid=%d → LOST at frame=%d (absent %d frames)", gid, frame_index, frames_absent)
+                # v6.0: Archive the best embedding at the moment of loss
+                best_embed = self._best_mean_embed(entry)
+                if best_embed is not None:
+                    self._archive_embeds[gid] = (best_embed.copy(), frame_index)
+                logger.debug("Gallery: gid=%d → LOST at frame=%d (absent %d frames, archive=%s)",
+                             gid, frame_index, frames_absent, gid in self._archive_embeds)
 
             elif entry["track_status"] == "lost":
                 lost_duration = frame_index - (entry["lost_since"] or frame_index)
@@ -371,6 +392,7 @@ class CrossViewGallery:
         class_id:     int,
         excluded_ids: set[int],
         part_embeds:  np.ndarray | None,
+        frame_index:  int = 0,
     ) -> tuple[int | None, float]:
         best_id    = None
         best_score = -1.0
@@ -378,10 +400,41 @@ class CrossViewGallery:
             if gid in excluded_ids or entry["class_id"] != class_id:
                 continue
             score, _ = self._score_entry(entry, query_vec, view_label, part_embeds)
+
+            # v6.0: Also check archive embedding (frozen at time of loss)
+            archive = self._archive_embeds.get(gid)
+            if archive is not None:
+                archived_embed, frame_lost = archive
+                archive_score = _cosine_sim(query_vec.flatten(), archived_embed.flatten())
+                # Use the better of the two scores
+                score = max(score, archive_score)
+
             if score > best_score:
                 best_score = score
                 best_id    = gid
         return best_id, best_score
+
+    def _compute_adaptive_reentry_threshold(self, gid: int, current_frame: int) -> float:
+        """
+        v6.0: Time-adaptive re-entry threshold.
+
+        Short absence  (< 5s):  lower threshold ~0.70 (same vehicle, slight change)
+        Medium absence (5-60s): standard        ~0.80
+        Long absence   (> 60s): higher          ~0.88+ (more evidence needed)
+
+        Formula: threshold = base + beta * log(1 + absence_frames / tau)
+        """
+        import math
+        entry = self._cold_storage.get(gid) or self._gallery.get(gid)
+        if entry is None:
+            return self._cold_reentry_thresh
+        last_seen = entry.get("last_seen", current_frame)
+        absence_frames = max(0, current_frame - last_seen)
+        adaptive = self._reentry_base_thresh + self._reentry_beta * math.log(
+            1.0 + absence_frames / self._reentry_tau
+        )
+        # Clamp to [base, 0.95] to avoid impossible thresholds
+        return min(adaptive, 0.95)
 
     @staticmethod
     def _best_mean_embed(entry: dict) -> np.ndarray | None:

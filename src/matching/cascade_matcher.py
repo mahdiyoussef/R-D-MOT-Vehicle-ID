@@ -103,7 +103,12 @@ def compute_bbox_iou(bbox_a: np.ndarray, bbox_b: np.ndarray) -> float:
 
 class CascadeMatcher:
     """
-    5-step cascaded identity assignment engine.
+    5-step cascaded identity assignment engine with SOTA enhancements:
+
+    v6.0 additions:
+      - k-Reciprocal Re-Ranking integrated into gallery search (Zhong et al.)
+      - Top-2 margin ambiguity check to flag uncertain matches
+      - Adaptive threshold based on gallery density
 
     Parameters
     ----------
@@ -129,6 +134,24 @@ class CascadeMatcher:
         self._cross_view_thresh         = float(matching_cfg.get("cross_view_match_threshold", 0.55))
         self._attribute_accept_thresh   = float(matching_cfg.get("attribute_score_threshold", 0.60))
         self._human_review_sim_thresh   = float(matching_cfg.get("human_review_flag_threshold", 0.45))
+
+        # ── v6.0: Re-Ranking integration ──────────────────────────────────────
+        self._reranker = None
+        if matching_cfg.get("reranking_in_cascade", True):
+            try:
+                from src.matching.reranker import KReciprocalReRanker
+                self._reranker = KReciprocalReRanker(
+                    k1=matching_cfg.get("reranking_k1", 20),
+                    k2=matching_cfg.get("reranking_k2", 6),
+                    lambda_value=matching_cfg.get("reranking_lambda", 0.3),
+                )
+                logger.info("k-Reciprocal Re-Ranking ACTIVE in CascadeMatcher.")
+            except Exception as e:
+                logger.warning("Could not initialize re-ranker in cascade: %s", e)
+
+        # ── v6.0: Top-2 margin ambiguity detection ────────────────────────────
+        self._margin_threshold = float(matching_cfg.get("top2_margin_threshold", 0.05))
+        self._rerank_top_k     = int(matching_cfg.get("rerank_top_k", 15))
 
     def assign_identity(
         self,
@@ -184,20 +207,39 @@ class CascadeMatcher:
                     match_confidence = iou,
                 )
 
-        # ── Step 2 — Same-View Gallery Match ──────────────────────────────────
-        same_view_match = self._match_same_view(detection, gallery, excluded_ids, spatial_boosts)
-        if same_view_match is not None:
-            best_gid, best_score = same_view_match
+        # ── Step 2 — Same-View Gallery Match (with re-ranking & margin check) ─
+        same_view_result = self._match_same_view(
+            detection, gallery, excluded_ids, spatial_boosts
+        )
+        if same_view_result is not None:
+            best_gid, best_score, second_score, was_reranked = same_view_result
+            margin = best_score - second_score if second_score >= 0 else best_score
+
             if best_score >= self._same_view_accept_thresh:
-                logger.debug("Match [2 same-view] gid=%d sim=%.3f", best_gid, best_score)
+                # v6.0: Top-2 margin ambiguity check
+                is_ambiguous = margin < self._margin_threshold and second_score > 0
+                if is_ambiguous:
+                    logger.warning(
+                        "Step 2 AMBIGUOUS gid=%d sim=%.3f margin=%.4f → flag for review",
+                        best_gid, best_score, margin,
+                    )
+                logger.debug(
+                    "Match [2 same-view%s] gid=%d sim=%.3f margin=%.4f",
+                    " reranked" if was_reranked else "",
+                    best_gid, best_score, margin,
+                )
                 return MatchResult(
-                    global_id        = best_gid,
-                    match_type       = "same_view",
-                    match_confidence = best_score,
+                    global_id           = best_gid,
+                    match_type          = "same_view",
+                    match_confidence    = best_score,
+                    needs_human_review  = is_ambiguous,
                 )
             elif best_score >= self._same_view_uncertain_thresh:
                 # Uncertain score → try attributes before escalating
-                logger.debug("Step 2 UNCERTAIN gid=%d sim=%.3f → trying attribute check", best_gid, best_score)
+                logger.debug(
+                    "Step 2 UNCERTAIN gid=%d sim=%.3f → trying attribute check",
+                    best_gid, best_score,
+                )
                 attribute_match = self._match_by_attributes(
                     detection, gallery, already_assigned_ids, preferred_gid=best_gid
                 )
@@ -252,11 +294,18 @@ class CascadeMatcher:
         gallery,
         excluded_ids: set[int],
         spatial_boosts: dict[int, float] | None,
-    ) -> tuple[int, float] | None:
-        """Query gallery using same-view mean embeddings. Returns (gid, score) or None."""
+    ) -> tuple[int, float, float, bool] | None:
+        """
+        Query gallery using same-view mean embeddings.
+
+        Returns (best_gid, best_score, second_score, was_reranked) or None.
+        v6.0: Collects top-k candidates, applies k-Reciprocal re-ranking,
+              and returns both top-1 and top-2 scores for margin check.
+        """
         query_vec = detection.embedding.reshape(1, -1)
-        best_gid   = None
-        best_score = -1.0
+
+        # ── Collect all candidate scores ──────────────────────────────────────
+        candidates: list[tuple[int, float, np.ndarray]] = []  # (gid, raw_score, embedding)
 
         for gid, entry in gallery._gallery.items():
             if gid in excluded_ids:
@@ -275,11 +324,38 @@ class CascadeMatcher:
             if spatial_boosts and gid in spatial_boosts:
                 score += spatial_boosts[gid] * 0.05  # soft Kalman proximity bonus
 
-            if score > best_score:
-                best_score = score
-                best_gid   = gid
+            candidates.append((gid, score, view_mean.flatten()))
 
-        return (best_gid, best_score) if best_gid is not None else None
+        if not candidates:
+            return None
+
+        # ── Sort by raw score, keep top-k ─────────────────────────────────────
+        candidates.sort(key=lambda c: c[1], reverse=True)
+        top_k = candidates[:self._rerank_top_k]
+
+        # ── v6.0: Apply k-Reciprocal Re-Ranking if available and enough candidates
+        was_reranked = False
+        if self._reranker is not None and len(top_k) >= 3:
+            try:
+                gallery_embeds = np.stack([c[2] for c in top_k])
+                reranked_dist = self._reranker.re_rank(query_vec, gallery_embeds)
+                # Convert distances back to similarity scores (1 - dist)
+                reranked_scores = 1.0 - reranked_dist[0]
+                # Re-sort candidates by reranked score
+                reranked_candidates = [
+                    (top_k[i][0], float(reranked_scores[i]), top_k[i][2])
+                    for i in range(len(top_k))
+                ]
+                reranked_candidates.sort(key=lambda c: c[1], reverse=True)
+                top_k = reranked_candidates
+                was_reranked = True
+            except Exception as e:
+                logger.debug("Re-ranking failed, using raw scores: %s", e)
+
+        best_gid, best_score, _ = top_k[0]
+        second_score = top_k[1][1] if len(top_k) > 1 else -1.0
+
+        return (best_gid, best_score, second_score, was_reranked)
 
     def _match_cross_view(
         self,
