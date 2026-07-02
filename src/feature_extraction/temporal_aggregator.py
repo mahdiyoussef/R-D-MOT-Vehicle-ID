@@ -154,11 +154,15 @@ class TemporalTrackletAggregator:
         self.buffer_size = int(self.cfg.get("buffer_size", 16))
         self.min_frames  = int(self.cfg.get("min_frames", 3))
 
+        # v6.0: Quality gating — discard low-quality embeddings
+        self._quality_min = float(self.cfg.get("quality_min_threshold", 0.15))
+        self._min_crop_area = float(self.cfg.get("min_crop_area", 2000.0))  # pixels²
+
         self.device = torch.device(
             config.get("pipeline", {}).get("device", "cpu")
         )
 
-        # Per-track embedding buffers: track_id → deque of np.ndarray
+        # Per-track embedding buffers: track_id → deque of (embedding, quality_score)
         self._buffers: dict[int, deque] = defaultdict(
             lambda: deque(maxlen=self.buffer_size)
         )
@@ -196,22 +200,53 @@ class TemporalTrackletAggregator:
                 int(self.cfg.get("num_heads", 4)),
             )
 
+    def compute_quality_score(
+        self,
+        confidence: float,
+        bbox: np.ndarray | None = None,
+    ) -> float:
+        """
+        v6.0: Compute a quality score for a detection crop.
+
+        Quality is a product of:
+          - Detection confidence (0-1)
+          - Normalized crop area (clamped to [0, 1])
+
+        Low-quality detections (blurry, tiny, occluded) get downweighted
+        in the temporal attention mechanism.
+
+        Returns
+        -------
+        float in [0, 1]
+        """
+        area_factor = 1.0
+        if bbox is not None:
+            w = max(0, bbox[2] - bbox[0])
+            h = max(0, bbox[3] - bbox[1])
+            crop_area = w * h
+            area_factor = min(crop_area / self._min_crop_area, 1.0)
+        return float(confidence * area_factor)
+
     def update_and_aggregate(
         self,
-        track_id:  int,
-        embedding: np.ndarray,
+        track_id:   int,
+        embedding:  np.ndarray,
+        confidence: float = 1.0,
+        bbox:       np.ndarray | None = None,
     ) -> np.ndarray:
         """
         Buffer an embedding for a track and return the aggregated result.
 
-        If temporal aggregation is disabled or fewer than min_frames
-        embeddings have been collected, returns the raw embedding.
-        Otherwise, runs the attention model over the buffered sequence.
+        v6.0: Quality-gated — low-quality embeddings are discarded before
+        buffering. During attention, quality scores serve as multiplicative
+        masks on the attention weights.
 
         Parameters
         ----------
-        track_id  : Short-term tracker ID
-        embedding : (D,) L2-normalized embedding from the Re-ID backend
+        track_id   : Short-term tracker ID
+        embedding  : (D,) L2-normalized embedding from the Re-ID backend
+        confidence : Detection confidence score
+        bbox       : [x1, y1, x2, y2] bounding box for crop area estimation
 
         Returns
         -------
@@ -220,19 +255,50 @@ class TemporalTrackletAggregator:
         if not self.enabled or self._model is None:
             return embedding
 
-        # Buffer the embedding
-        self._buffers[track_id].append(embedding.copy())
+        # v6.0: Compute quality and discard if below minimum threshold
+        quality = self.compute_quality_score(confidence, bbox)
+        if quality < self._quality_min:
+            logger.debug(
+                "Track %d: discarding low-quality embedding (quality=%.3f < %.3f)",
+                track_id, quality, self._quality_min,
+            )
+            # Still return the raw embedding but don't buffer it
+            buf = self._buffers.get(track_id)
+            if buf and len(buf) >= self.min_frames:
+                # Return last good aggregation instead
+                return self._aggregate_buffer(buf)
+            return embedding
+
+        # Buffer the embedding with its quality score
+        self._buffers[track_id].append((embedding.copy(), quality))
 
         buf = self._buffers[track_id]
         if len(buf) < self.min_frames:
-            # Not enough history — return raw embedding
             return embedding
 
-        # Build sequence tensor: (1, T, D)
-        seq = np.stack(list(buf), axis=0)  # (T, D)
-        seq_tensor = torch.from_numpy(seq).unsqueeze(0).to(self.device)
+        return self._aggregate_buffer(buf)
 
-        # Run temporal attention
+    def _aggregate_buffer(self, buf: deque) -> np.ndarray:
+        """
+        Run temporal attention over a quality-weighted embedding buffer.
+
+        Quality scores are used to scale the context embeddings before
+        attention, effectively suppressing noisy/blurry frames.
+        """
+        embeddings = [item[0] for item in buf]
+        qualities  = [item[1] for item in buf]
+
+        # Build sequence tensor: (1, T, D)
+        seq = np.stack(embeddings, axis=0)  # (T, D)
+        quality_arr = np.array(qualities, dtype=np.float32)  # (T,)
+
+        # v6.0: Scale each embedding by its quality score before attention
+        # This acts as a soft mask — low quality frames contribute less
+        quality_weights = quality_arr / (quality_arr.sum() + 1e-8) * len(quality_arr)
+        seq_weighted = seq * quality_weights[:, None]
+
+        seq_tensor = torch.from_numpy(seq_weighted).unsqueeze(0).to(self.device)
+
         with torch.no_grad():
             aggregated = self._model(seq_tensor)  # (1, D)
 
